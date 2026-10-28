@@ -1,0 +1,39 @@
+{
+  "name": "cloudops-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted, provider-agnostic Cloud Operations Command Center",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "dev": "pnpm --parallel --filter \"./apps/*\" dev",
+    "dev:api": "pnpm --filter @cloudops/api dev",
+    "dev:web": "pnpm --filter @cloudops/web dev",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "test": "pnpm -r test",
+    "prisma:generate": "pnpm --filter @cloudops/api prisma:generate",
+    "db:migrate": "pnpm --filter @cloudops/api db:migrate",
+    "prisma:seed": "pnpm --filter @cloudops/api prisma:seed",
+    "format": "prettier --write \"**/*.{ts,tsx,js,json,md}\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.0",
+    "@typescript-eslint/eslint-plugin": "^8.8.0",
+    "@typescript-eslint/parser": "^8.8.0",
+    "eslint": "^8.57.1",
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3"
+  },
+  "pnpm": {
+    "overrides": {
+      "qs@<6.16.0": "^6.16.0"
+    }
+  }
+}

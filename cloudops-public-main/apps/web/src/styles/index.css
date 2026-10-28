@@ -1,0 +1,221 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * CloudOps design tokens — "instrument panel" theme.
+ * Values are RGB triplets so Tailwind opacity modifiers work (see tailwind.config.js).
+ * Neutrals carry a faint blue-green cast; one signal accent is used sparingly.
+ */
+@layer base {
+  :root {
+    color-scheme: dark;
+
+    /* Surfaces — elevation 0 → 3 */
+    --canvas: 10 13 15; /* app background */
+    --surface: 16 20 23; /* panels */
+    --raised: 22 27 31; /* table heads, segmented thumbs, inputs on panels */
+    --overlay: 25 32 37; /* menus, dialogs, toasts */
+    --hover: 30 38 44; /* interactive hover fill */
+
+    /* Lines */
+    --line: 37 46 53;
+    --line-subtle: 27 34 40;
+    --line-strong: 53 66 76;
+
+    /* Text */
+    --fg: 230 235 238; /* primary      ~15:1 on surface */
+    --fg-secondary: 169 180 187; /* secondary    ~8.5:1 */
+    --fg-muted: 118 131 140; /* meta/labels  ~4.7:1 (AA) */
+    --fg-faint: 85 97 106; /* decoration only, never body text */
+
+    /* Signal accent (teal-cyan) */
+    --accent: 56 212 197;
+    --accent-hover: 95 224 211;
+    --accent-active: 37 185 171;
+    --accent-fg: 4 36 32; /* text on accent fills */
+
+    /* Status — hues kept clear of the accent */
+    --success: 86 194 113;
+    --warning: 232 174 69;
+    --danger: 240 104 104;
+    --info: 107 166 247;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-canvas font-sans text-body text-fg antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid rgb(var(--accent));
+    outline-offset: 2px;
+  }
+  /* For focusable things inside clipped containers (table rows, grid cells). */
+  .focus-inset:focus-visible {
+    outline-offset: -2px;
+  }
+
+  ::selection {
+    background: rgb(var(--accent) / 0.3);
+    color: rgb(var(--fg));
+  }
+
+  input[type='checkbox'],
+  input[type='radio'] {
+    accent-color: rgb(var(--accent));
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--line-strong)) transparent;
+  }
+
+  code,
+  kbd,
+  samp,
+  pre {
+    @apply font-mono;
+  }
+}
+
+@layer components {
+  /* ── Data tables ─────────────────────────────────────────────── */
+  .data-table {
+    @apply w-full border-separate border-spacing-0 text-body;
+  }
+  .data-table thead th {
+    @apply whitespace-nowrap border-b border-line bg-raised/60 px-4 py-2 text-left font-mono text-overline uppercase text-fg-muted;
+  }
+  .data-table tbody td {
+    @apply border-b border-line-subtle px-4 py-2.5 align-middle text-fg-secondary;
+  }
+  .data-table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+  .data-table tbody tr {
+    @apply transition-colors duration-150;
+  }
+  .data-table tbody tr[data-interactive] {
+    @apply cursor-pointer;
+  }
+  .data-table tbody tr[data-interactive]:hover td,
+  .data-table tbody tr[data-expanded] td {
+    @apply bg-hover/50;
+  }
+  .data-table .num {
+    @apply text-right font-mono tabular-nums;
+  }
+  .data-table--compact thead th {
+    @apply px-3 py-1.5;
+  }
+  .data-table--compact tbody td {
+    @apply px-3 py-2;
+  }
+
+  /* ── Divided grids (readout strips, signal grids) ─────────────
+   * Children draw right+bottom hairlines; the grid overhangs its clipped
+   * container by 1px so outer edges never double up with the border. */
+  .cell-grid {
+    @apply -mb-px -mr-px grid;
+  }
+  .cell-grid > * {
+    box-shadow:
+      inset -1px 0 0 rgb(var(--line-subtle)),
+      inset 0 -1px 0 rgb(var(--line-subtle));
+  }
+
+  /* ── Links ───────────────────────────────────────────────────── */
+  .link {
+    @apply rounded-xs text-accent underline-offset-2 transition-colors duration-150 hover:text-accent-hover hover:underline;
+  }
+  .link-quiet {
+    @apply rounded-xs text-fg transition-colors duration-150 hover:text-accent;
+  }
+
+  /* ── Loading skeleton ────────────────────────────────────────── */
+  .skeleton {
+    @apply animate-shimmer rounded-xs;
+    background-image: linear-gradient(
+      90deg,
+      rgb(var(--raised)) 0%,
+      rgb(var(--hover)) 50%,
+      rgb(var(--raised)) 100%
+    );
+    background-size: 200% 100%;
+  }
+
+  /* ── Markdown preview (workspaces docs) ──────────────────────── */
+  .md-prose {
+    @apply text-body leading-relaxed text-fg-secondary;
+  }
+  .md-prose > :first-child {
+    @apply mt-0;
+  }
+  .md-prose h1 {
+    @apply mb-2 mt-6 text-h2 text-fg;
+  }
+  .md-prose h2 {
+    @apply mb-2 mt-5 text-h3 text-fg;
+  }
+  .md-prose h3 {
+    @apply mb-1 mt-4 text-h4 text-fg;
+  }
+  .md-prose p {
+    @apply my-3;
+  }
+  .md-prose ul {
+    @apply my-3 ml-5 list-disc space-y-1 marker:text-fg-muted;
+  }
+  .md-prose strong {
+    @apply font-semibold text-fg;
+  }
+  .md-prose a {
+    @apply text-accent underline underline-offset-2 hover:text-accent-hover;
+  }
+  .md-prose code {
+    @apply rounded-xs border border-line bg-raised px-1 py-px font-mono text-[0.8125em] text-fg;
+  }
+  .md-prose pre {
+    @apply my-3 overflow-x-auto rounded-sm border border-line bg-canvas p-3 font-mono text-caption text-fg;
+  }
+}
+
+/*
+ * Unlayered on purpose: Tailwind purges layered rules whose class never appears
+ * in source, and `lucide` is only added at runtime by lucide-react.
+ */
+svg.lucide {
+  stroke-width: 1.75px;
+  flex-shrink: 0;
+}
+
+/* Phones: tighter cell padding so dense tables fit without sideways scrolling. */
+@media (max-width: 639px) {
+  .data-table thead th,
+  .data-table tbody td {
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

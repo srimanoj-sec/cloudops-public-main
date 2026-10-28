@@ -1,0 +1,852 @@
+// CloudOps Platform — Prisma schema
+// Designed for unlimited providers, tenants, subscriptions, RGs, resources,
+// work items, docs, snapshots and relationships. Skeleton creates all of this;
+// later phases extend behavior, not the shape.
+
+generator client {
+  provider        = "prisma-client-js"
+  // pg_trgm-backed GIN index for fast fuzzy resource search (P6).
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pg_trgm]
+}
+
+// ───────────────────────── Identity / RBAC ─────────────────────────
+
+model User {
+  id                  String             @id @default(cuid())
+  email               String             @unique
+  name                String
+  passwordHash        String
+  isActive            Boolean            @default(true)
+  /// Last successful sign-in (shown on the Users admin page).
+  lastLoginAt         DateTime?
+  /// Set whenever the password changes; sessions issued before it are revoked.
+  passwordChangedAt   DateTime?
+  /// The current password was set by someone else (admin, CLI, seed) — the
+  /// user is asked to choose their own at next sign-in.
+  mustChangePassword  Boolean            @default(false)
+  /// "Mark all read" watermark: notifications created before it count as read.
+  notificationsSeenAt DateTime?
+  /// "Sign out everywhere": access tokens issued before it are rejected.
+  sessionsValidAfter  DateTime?
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+  roles               UserRole[]
+  sessions            Session[]
+  notificationReads   NotificationRead[]
+}
+
+model Role {
+  id          String     @id @default(cuid())
+  key         String     @unique // 'admin' | 'operator' | 'viewer'
+  description String?
+  users       UserRole[]
+}
+
+model UserRole {
+  userId String
+  roleId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+}
+
+// Refresh-token sessions. Stores only a hash of the refresh token.
+model Session {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash String
+  userAgent        String?
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([userId])
+  // Expired/revoked session cleanup.
+  @@index([expiresAt])
+}
+
+// ───────────────────────── Provider layer ─────────────────────────
+
+model Provider {
+  id           String               @id @default(cuid())
+  key          String               @unique // 'azure', 'aws', ...
+  displayName  String
+  capabilities String[]
+  status       String               @default("registered")
+  connections  ProviderConnection[]
+  createdAt    DateTime             @default(now())
+}
+
+// NON-SECRET connection metadata only. Credentials are NEVER stored here —
+// they are resolved at runtime by the CredentialProvider chain.
+model ProviderConnection {
+  id             String   @id @default(cuid())
+  providerId     String
+  provider       Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  displayName    String
+  tenantExternal String?
+  subscriptionId String?
+  capabilities   String[]
+  createdAt      DateTime @default(now())
+
+  @@index([providerId])
+}
+
+model ProviderInsightSnapshot {
+  id          String   @id @default(cuid())
+  providerKey String
+  projectId   String
+  capability  String
+  data        Json     @default("[]")
+  error       String?
+  syncedAt    DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([providerKey, projectId, capability])
+  @@index([providerKey, syncedAt])
+}
+
+// ───────────────────────── Inventory ─────────────────────────
+
+model Tenant {
+  id            String         @id @default(cuid())
+  providerKey   String         @default("azure")
+  externalId    String         @unique
+  name          String
+  subscriptions Subscription[]
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+}
+
+model ManagementGroup {
+  id          String   @id @default(cuid())
+  providerKey String   @default("azure")
+  externalId  String   @unique
+  name        String
+  parentId    String?
+  createdAt   DateTime @default(now())
+}
+
+model Subscription {
+  id             String          @id @default(cuid())
+  providerKey    String          @default("azure")
+  externalId     String          @unique
+  name           String
+  tenantId       String?
+  tenant         Tenant?         @relation(fields: [tenantId], references: [id])
+  state          String?
+  resourceGroups ResourceGroup[]
+  resources      Resource[]
+  lastSyncedAt   DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([tenantId])
+}
+
+model ResourceGroup {
+  id             String       @id @default(cuid())
+  providerKey    String       @default("azure")
+  externalId     String       @unique
+  name           String
+  location       String?
+  tags           Json         @default("{}")
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  resources      Resource[]
+  lastSyncedAt   DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([subscriptionId])
+}
+
+enum ResourceState {
+  active
+  deleted
+}
+
+enum LifecycleStage {
+  Created
+  Modified
+  Migrated
+  Deprecated
+  Retired
+  Deleted
+}
+
+model Resource {
+  id              String         @id @default(cuid())
+  providerKey     String         @default("azure")
+  externalId      String         @unique
+  name            String
+  type            String
+  location        String?
+  sku             String?
+  state           ResourceState  @default(active)
+  lifecycleStage  LifecycleStage @default(Created)
+  tags            Json           @default("{}")
+  /// Tags stored ONLY in CloudOps (for resources Azure can't tag). Merged with `tags` for display.
+  platformTags    Json?
+  /// null = untested, true = tag write succeeded, false = Azure rejected tags for this type.
+  taggableInAzure Boolean?
+  properties      Json           @default("{}")
+  /// Hash of `properties` — lets a sync refresh changed configuration cheaply (without diffing the blob).
+  propertiesHash  String?
+  // Lifecycle / ownership enrichment (P1). owner + azureCreatedAt come from the
+  // provider (owner tag, ARM created time). retireBy/inUse/cost* are set by the
+  // user or later phases (FinOps, idle detection) — schema-forward, nullable.
+  owner           String?
+  azureCreatedAt  DateTime?
+  retireBy        DateTime?
+  inUse           Boolean?
+  costDaily       Float?
+  costMonthly     Float?
+  subscriptionId  String?
+  subscription    Subscription?  @relation(fields: [subscriptionId], references: [id])
+  resourceGroupId String?
+  resourceGroup   ResourceGroup? @relation(fields: [resourceGroupId], references: [id])
+  lastSyncedAt    DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  relationshipsFrom  ResourceRelationship[]   @relation("relFrom")
+  relationshipsTo    ResourceRelationship[]   @relation("relTo")
+  snapshots          ResourceSnapshot[]
+  changeEvents       ChangeEvent[]
+  lifecycleEvents    AssetLifecycleEvent[]
+  serviceMaps        ResourceServiceMap[]
+  environmentMaps    ResourceEnvironmentMap[]
+  costRecords        CostRecord[]
+  remediationTargets RemediationTarget[]
+  exemptions         ComplianceExemption[]
+
+  @@index([type])
+  @@index([location])
+  @@index([subscriptionId])
+  @@index([resourceGroupId])
+  @@index([state])
+  @@index([owner])
+  @@index([lifecycleStage])
+  // Trigram GIN index accelerates fuzzy ILIKE search on the resource name (P6).
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  // Global search matches ids / pasted ARM paths too.
+  @@index([externalId(ops: raw("gin_trgm_ops"))], type: Gin)
+}
+
+model ResourceRelationship {
+  id        String   @id @default(cuid())
+  type      String // depends-on | network | identity | rbac | contains
+  sourceId  String
+  source    Resource @relation("relFrom", fields: [sourceId], references: [id], onDelete: Cascade)
+  targetId  String
+  target    Resource @relation("relTo", fields: [targetId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([sourceId, targetId, type])
+  @@index([targetId])
+}
+
+// ───────────── Business & environment context (cap BSE) ─────────────
+
+model BusinessService {
+  id          String               @id @default(cuid())
+  name        String               @unique
+  description String?
+  owner       String?
+  createdAt   DateTime             @default(now())
+  resources   ResourceServiceMap[]
+}
+
+enum EnvironmentType {
+  Production
+  Stage
+  QA
+  Dev
+  Sandbox
+}
+
+model Environment {
+  id        String                   @id @default(cuid())
+  name      String                   @unique
+  type      EnvironmentType
+  resources ResourceEnvironmentMap[]
+  createdAt DateTime                 @default(now())
+}
+
+model ResourceServiceMap {
+  resourceId String
+  serviceId  String
+  resource   Resource        @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  service    BusinessService @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([resourceId, serviceId])
+}
+
+model ResourceEnvironmentMap {
+  resourceId    String
+  environmentId String
+  resource      Resource    @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  environment   Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@id([resourceId, environmentId])
+}
+
+// ───────────── Asset lifecycle timeline (cap LC) ─────────────
+
+model AssetLifecycleEvent {
+  id         String         @id @default(cuid())
+  resourceId String
+  resource   Resource       @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  stage      LifecycleStage
+  actor      String?
+  reason     String?
+  createdAt  DateTime       @default(now())
+
+  @@index([resourceId])
+}
+
+// ───────────────────────── Sync / audit / history ─────────────────────────
+
+enum SyncStatus {
+  queued
+  running
+  completed
+  failed
+}
+
+model SyncRun {
+  id          String     @id @default(cuid())
+  providerKey String
+  scope       String?
+  status      SyncStatus @default(queued)
+  created     Int        @default(0)
+  updated     Int        @default(0)
+  changes     Int        @default(0)
+  /// Resources no longer present in Azure that this run marked deleted.
+  deleted     Int        @default(0)
+  error       String?
+  /// Who started it (display name), or null for the scheduler / automation.
+  triggeredBy String?
+  // Per-organization rollup (orgs/subs/resources, skipped) — structured SyncSummary.
+  summary     Json?
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime   @default(now())
+
+  @@index([providerKey])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model ChangeEvent {
+  id         String   @id @default(cuid())
+  resourceId String
+  resource   Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  field      String
+  oldValue   Json?
+  newValue   Json?
+  syncRunId  String?
+  detectedAt DateTime @default(now())
+
+  @@index([resourceId])
+  @@index([syncRunId])
+  // Dashboard "recent drift" feed orders by detection time.
+  @@index([detectedAt])
+}
+
+model ResourceSnapshot {
+  id         String   @id @default(cuid())
+  resourceId String
+  resource   Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  snapshot   Json
+  syncRunId  String?
+  createdAt  DateTime @default(now())
+
+  @@index([resourceId])
+}
+
+// ───────────────────────── Cost / FinOps ─────────────────────────
+
+// One resource's cost for one day. Idempotent per (resourceExternalId, date):
+// a cost sync deletes + recreates the window, so re-runs never double-count.
+model CostRecord {
+  id                      String    @id @default(cuid())
+  providerKey             String    @default("azure")
+  resourceExternalId      String // lowercased Azure resource id (for matching)
+  subscriptionExternalId  String?
+  resourceGroupExternalId String? // lowercased RG external id (for RG rollups/filters)
+  resourceId              String?
+  resource                Resource? @relation(fields: [resourceId], references: [id], onDelete: SetNull)
+  date                    DateTime // day (UTC midnight)
+  /// Amount in the reporting currency (COST_CURRENCY) — converted at ingest when Azure billed another currency.
+  cost                    Float
+  currency                String    @default("USD")
+  /// What Azure reported, when it was converted (audit trail); null when already in the reporting currency.
+  originalCost            Float?
+  originalCurrency        String?
+  /// Units of `currency` per 1 `originalCurrency` used for the conversion.
+  fxRate                  Float?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  @@unique([resourceExternalId, date])
+  @@index([date])
+  @@index([subscriptionExternalId])
+  @@index([resourceGroupExternalId])
+  @@index([resourceId])
+}
+
+// ───────────────────────── Standards / scoring ─────────────────────────
+
+model Standard {
+  id          String         @id @default(cuid())
+  key         String         @unique
+  name        String
+  description String?
+  /// builtin (code-defined catalog) | custom (user-authored)
+  source      String         @default("builtin")
+  rules       StandardRule[]
+  createdAt   DateTime       @default(now())
+}
+
+model StandardRule {
+  id            String                @id @default(cuid())
+  standardId    String
+  standard      Standard              @relation(fields: [standardId], references: [id], onDelete: Cascade)
+  key           String
+  /// Human label. Built-ins use `description`; custom rules set a `name`.
+  name          String?
+  description   String
+  severity      String                @default("medium")
+  /// builtin (evaluated by code) | custom (evaluated declaratively from the fields below)
+  source        String                @default("builtin")
+  enabled       Boolean               @default(true)
+  // ── Declarative config (custom rules only) ──
+  /// tag | name | type | location | owner | lifecycleStage | cost
+  field         String?
+  /// exists | not_exists | equals | not_equals | matches | in | not_in
+  operator      String?
+  value         String?
+  tagKey        String?
+  /// Optional: only evaluate resources whose type contains this (case-insensitive).
+  appliesToType String?
+  // ── v2 ──
+  /// security | cost | reliability | tagging | naming | governance | operations
+  category      String?
+  /// Library template this rule instantiates (built-in + custom-from-template rules).
+  template      String?
+  /// Template parameters (merged over the template defaults at evaluation).
+  params        Json?
+  /// Custom conditions: { match: 'all'|'any', conditions: [...] }.
+  definition    Json?
+  /// Which resources the rule applies to: { types, locations, subscriptionIds, resourceGroupIds, tagKey, tagValues }.
+  scope         Json?
+  /// How to fix a failure (custom rules; built-ins take it from the library).
+  remediation   String?
+  results       ComplianceResult[]
+  exemptions    ComplianceExemption[]
+
+  @@unique([standardId, key])
+}
+
+model ComplianceResult {
+  id          String       @id @default(cuid())
+  ruleId      String
+  rule        StandardRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  scopeType   String // resource | resourceGroup | subscription | provider
+  scopeId     String
+  passed      Boolean
+  /// A failing verdict covered by an active exemption — shown, but not scored.
+  exempt      Boolean      @default(false)
+  score       Int?
+  detail      String?
+  evaluatedAt DateTime     @default(now())
+
+  @@index([scopeType, scopeId])
+  // Rule drilldown (failing/passing resources for one rule).
+  @@index([ruleId, passed])
+}
+
+/// An accepted exception: this resource does not have to meet this rule (with a reason, optionally until a date).
+model ComplianceExemption {
+  id          String       @id @default(cuid())
+  ruleId      String
+  rule        StandardRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  resourceId  String
+  resource    Resource     @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  reason      String
+  expiresAt   DateTime?
+  createdById String?
+  createdBy   String?
+  createdAt   DateTime     @default(now())
+
+  @@unique([ruleId, resourceId])
+  @@index([resourceId])
+}
+
+/// A monthly spend limit for a scope, tracked against month-to-date cost and the month-end forecast.
+model Budget {
+  id           String   @id @default(cuid())
+  name         String
+  /// all | organization | subscription | resourceGroup
+  scopeType    String   @default("all")
+  /// Tenant / Subscription / ResourceGroup db id (null for all).
+  scopeId      String?
+  /// Monthly amount in the reporting currency (COST_CURRENCY).
+  amount       Float
+  /// Flag the budget "at risk" when the forecast reaches this share of it (percent).
+  alertPercent Int      @default(80)
+  createdById  String?
+  createdBy    String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// ───────────────────────── Work management ─────────────────────────
+
+enum WorkItemState {
+  todo
+  in_progress
+  blocked
+  done
+}
+
+model Board {
+  id        String        @id @default(cuid())
+  name      String
+  columns   BoardColumn[]
+  createdAt DateTime      @default(now())
+}
+
+model BoardColumn {
+  id      String     @id @default(cuid())
+  boardId String
+  board   Board      @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  name    String
+  order   Int        @default(0)
+  items   WorkItem[]
+}
+
+model Sprint {
+  id        String     @id @default(cuid())
+  name      String
+  startsAt  DateTime?
+  endsAt    DateTime?
+  items     WorkItem[]
+  createdAt DateTime   @default(now())
+}
+
+model WorkItem {
+  id          String            @id @default(cuid())
+  title       String
+  description String?
+  type        String            @default("task") // task | cost | security | incident | change | review | ...
+  state       WorkItemState     @default(todo)
+  priority    Int               @default(3)
+  effort      Int?
+  dueDate     DateTime?
+  assignee    String?
+  // Recurring reviews: null = one-off. When a recurring item is completed the
+  // service materializes the next occurrence (dueDate advanced by the cadence).
+  recurrence  String? // weekly | monthly | quarterly
+  /// What created this item — a compliance finding, cost anomaly, drift, failed
+  /// sync, remediation, automation rule… (sourceType + sourceId), with a label
+  /// kept for when the source no longer exists.
+  sourceType  String?
+  sourceId    String?
+  sourceLabel String?
+  createdById String?
+  createdBy   String?
+  columnId    String?
+  column      BoardColumn?      @relation(fields: [columnId], references: [id])
+  sprintId    String?
+  sprint      Sprint?           @relation(fields: [sprintId], references: [id])
+  links       WorkItemLink[]
+  comments    Comment[]
+  labels      LabelOnWorkItem[]
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([state])
+  @@index([type])
+  @@index([sourceType, sourceId])
+  @@index([dueDate])
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin)
+}
+
+model WorkItemLink {
+  id         String   @id @default(cuid())
+  workItemId String
+  workItem   WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  scopeType  String // resource | resourceGroup | subscription
+  scopeId    String
+
+  @@index([scopeType, scopeId])
+}
+
+model Comment {
+  id         String   @id @default(cuid())
+  workItemId String
+  workItem   WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  author     String
+  body       String
+  createdAt  DateTime @default(now())
+}
+
+model Label {
+  id    String            @id @default(cuid())
+  name  String            @unique
+  color String            @default("#64748b")
+  items LabelOnWorkItem[]
+}
+
+model LabelOnWorkItem {
+  workItemId String
+  labelId    String
+  workItem   WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  label      Label    @relation(fields: [labelId], references: [id], onDelete: Cascade)
+
+  @@id([workItemId, labelId])
+}
+
+// ───────────────────────── Workspaces / docs ─────────────────────────
+
+model Workspace {
+  id        String     @id @default(cuid())
+  scopeType String // organization | subscription | resourceGroup | resource
+  scopeId   String
+  title     String
+  documents Document[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@unique([scopeType, scopeId])
+}
+
+model Document {
+  id          String             @id @default(cuid())
+  workspaceId String
+  workspace   Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  title       String
+  body        String             @default("")
+  kind        String             @default("doc") // doc | runbook | sop | knowledge
+  // Git-backed knowledge store (cap 15): path + last commit ref in the local repo.
+  gitPath     String?
+  gitCommit   String?
+  createdBy   String?
+  updatedBy   String?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+  revisions   DocumentRevision[]
+
+  @@index([workspaceId])
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin)
+}
+
+/// A document as it was before an edit — the version history.
+model DocumentRevision {
+  id         String   @id @default(cuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  title      String
+  body       String
+  kind       String
+  /// Who wrote this version.
+  author     String?
+  createdAt  DateTime @default(now())
+
+  @@index([documentId, createdAt])
+}
+
+// ───────────────────────── Saved views (P6) ─────────────────────────
+
+// A named, reusable filter set for a page (inventory first). Shared across the
+// team; `createdBy` records the author. `filters` is the serialized query state.
+model SavedView {
+  id        String   @id @default(cuid())
+  name      String
+  scope     String   @default("inventory") // which explorer the view belongs to
+  filters   Json     @default("{}")
+  createdBy String? // user id of the author (nullable = legacy/system)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([scope])
+}
+
+// ───────────────────────── Cross-cutting audit ─────────────────────────
+
+// Who did what, when, to what. Append-only; never holds secrets.
+model AuditLog {
+  id        String   @id @default(cuid())
+  /// Display name / email of the actor at the time (kept even if the user is later renamed).
+  actor     String?
+  /// User id of the actor (null for system actions and failed sign-ins).
+  actorId   String?
+  action    String
+  entity    String
+  entityId  String?
+  metadata  Json?
+  /// Client IP and request correlation id, for incident investigation.
+  ip        String?
+  requestId String?
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([createdAt])
+  @@index([action])
+  @@index([actorId])
+  // Correlation: every event written while serving one request.
+  @@index([requestId])
+}
+
+// ───────────────────────── Notifications ─────────────────────────
+
+/// Something a person should know about (a sync failed, an exemption expires, you were mentioned…).
+model Notification {
+  id         String             @id @default(cuid())
+  /// sync | cost | compliance | work | remediation | automation | system
+  category   String
+  /// critical | high | medium | low | info
+  severity   String             @default("info")
+  title      String
+  body       String?
+  /// In-app route to the object it is about.
+  link       String?
+  entityType String?
+  entityId   String?
+  /// Only users holding this permission see it (null = every user). Ignored when userId is set.
+  audience   String?
+  /// Addressed to one user (mentions, assignments).
+  userId     String?
+  /// Who caused it — a broadcast isn't shown to its own actor (e.g. "approval needed" to the requester).
+  actorId    String?
+  /// One notification per condition (e.g. work.overdue:<id>), so repeated checks don't pile up.
+  dedupeKey  String?            @unique
+  createdAt  DateTime           @default(now())
+  reads      NotificationRead[]
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+}
+
+model NotificationRead {
+  notificationId String
+  userId         String
+  readAt         DateTime     @default(now())
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([notificationId, userId])
+  @@index([userId])
+}
+
+// ───────────────────────── Remediation ─────────────────────────
+
+/// One requested change (an action from the catalog) against one or more resources.
+model RemediationRun {
+  id            String              @id @default(cuid())
+  /// Action catalog key, e.g. azure.webapp.https-only.
+  actionKey     String
+  title         String
+  providerKey   String              @default("azure")
+  /// low | medium | high
+  risk          String
+  /// pending_approval | approved | rejected | queued | running | completed | partial | failed | cancelled
+  status        String
+  params        Json?
+  /// What prompted it: rule (finding), anomaly, drift, resource, work item…
+  sourceType    String?
+  sourceId      String?
+  workItemId    String?
+  requestedById String?
+  requestedBy   String?
+  approvedById  String?
+  approvedBy    String?
+  decidedAt     DateTime?
+  decisionNote  String?
+  executedById  String?
+  executedBy    String?
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  /// { total, succeeded, failed, skipped, verified }
+  summary       Json?
+  /// Execution log: [{ at, level, message }].
+  log           Json                @default("[]")
+  error         String?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+  targets       RemediationTarget[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([sourceType, sourceId])
+}
+
+model RemediationTarget {
+  id           String         @id @default(cuid())
+  runId        String
+  run          RemediationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  resourceId   String
+  resource     Resource       @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  resourceName String
+  externalId   String
+  /// pending | skipped | running | succeeded | verified | verify_failed | failed
+  status       String         @default("pending")
+  /// Value(s) before the change (for rollback), and after (as read back from the provider).
+  before       Json?
+  after        Json?
+  /// The provider call that will be / was made — shown in the preview.
+  command      String?
+  message      String?
+  startedAt    DateTime?
+  finishedAt   DateTime?
+
+  @@index([runId])
+  @@index([resourceId])
+}
+
+// ───────────────────────── Automation ─────────────────────────
+
+/// Trigger → conditions → actions. Evaluated when the trigger event fires.
+model AutomationRule {
+  id          String          @id @default(cuid())
+  name        String
+  description String?
+  enabled     Boolean         @default(true)
+  /// Event key, e.g. sync.failed, cost.anomaly, compliance.failing.
+  trigger     String
+  conditions  Json            @default("{}")
+  actions     Json            @default("[]")
+  createdById String?
+  createdBy   String?
+  lastRunAt   DateTime?
+  runCount    Int             @default(0)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  runs        AutomationRun[]
+}
+
+model AutomationRun {
+  id        String         @id @default(cuid())
+  ruleId    String
+  rule      AutomationRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  trigger   String
+  /// succeeded | failed | skipped
+  status    String
+  /// What fired it and what the actions did.
+  detail    Json?
+  error     String?
+  createdAt DateTime       @default(now())
+
+  @@index([ruleId, createdAt])
+}

@@ -1,0 +1,141 @@
+name: cloudops-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cloudops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cloudops}
+      POSTGRES_DB: ${POSTGRES_DB:-cloudops}
+    # Published on localhost only (host-mode API + your DB tools). The api
+    # container reaches it over the compose network regardless.
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cloudops} -d ${POSTGRES_DB:-cloudops}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    # Localhost only — Redis has no password; never expose it to the network.
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    # tini as PID 1: forwards SIGTERM to Node and reaps `az` child processes.
+    init: true
+    # Time for in-flight syncs/tag jobs to finish before a hard kill.
+    stop_grace_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      API_PORT: ${API_PORT:-3000}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      AZURE_ALLOW_WRITE: ${AZURE_ALLOW_WRITE:-true}
+      REMEDIATION_SELF_APPROVAL: ${REMEDIATION_SELF_APPROVAL:-false}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      FINOPS_WINDOW_DAYS: ${FINOPS_WINDOW_DAYS:-90}
+      FINOPS_DAILY_SYNC: ${FINOPS_DAILY_SYNC:-false}
+      # Every cost is stored/shown in this currency; other billing currencies
+      # are converted during the cost sync (rate: COST_FX_RATES, else Azure's
+      # retail price list).
+      COST_CURRENCY: ${COST_CURRENCY:-INR}
+      COST_FX_RATES: ${COST_FX_RATES:-}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://cloudops:cloudops@postgres:5432/cloudops?schema=public}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev-access-secret-change-me}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev-refresh-secret-change-me}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-7d}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@cloudops.local}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-ChangeMe123!}
+      CREDENTIAL_PROVIDER: ${CREDENTIAL_PROVIDER:-azure-cli}
+      # Local encrypted credential store — orgs added in the Providers UI live
+      # in the cloudops_data volume below, never in Postgres.
+      CLOUDOPS_DATA_DIR: ${CLOUDOPS_DATA_DIR:-/data}
+      CREDENTIAL_STORE_KEY: ${CREDENTIAL_STORE_KEY:-}
+      AZURE_CONFIG_DIR: ${AZURE_CONFIG_DIR:-/root/.azure}
+      # Optional: declare multi-org service principals here instead of the UI
+      # (JSON array, one SP per Entra tenant). Never stored in the DB.
+      AZURE_ORGS: ${AZURE_ORGS:-}
+      # Single-SP fallback.
+      AZURE_ORG_NAME: ${AZURE_ORG_NAME:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+    ports:
+      - "3000:3000"
+    volumes:
+      # Writable, container-local Azure CLI config (host-mode style `az` state).
+      # A Windows interactive `az login` CANNOT be reused here (DPAPI-encrypted
+      # token cache is not portable to Linux) — use service principals, or run the
+      # API on the host (see docs/deployment.md).
+      - azure_config:/root/.azure
+      # Encrypted credential store (+ its key file) and the per-organization
+      # Azure CLI profiles. Deleting this volume means re-entering every
+      # organization's client secret.
+      - cloudops_data:/data
+    healthcheck:
+      # Ready = Postgres AND Redis reachable.
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Baked into the bundle — the browser calls the API at this URL.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:3000}
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      # Allowed in the Content-Security-Policy connect-src (origin of the URL above).
+      API_ORIGIN: ${API_ORIGIN:-http://localhost:3000}
+    ports:
+      - "5173:8080"
+
+  # Optional lightweight DB browser — `docker compose --profile tools up adminer`
+  adminer:
+    image: adminer:latest
+    restart: unless-stopped
+    profiles: ["tools"]
+    depends_on:
+      - postgres
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  postgres_data:
+  redis_data:
+  azure_config:
+  cloudops_data:

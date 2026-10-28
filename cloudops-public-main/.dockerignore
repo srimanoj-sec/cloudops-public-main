@@ -1,0 +1,12 @@
+**/node_modules
+**/dist
+**/.turbo
+**/*.tsbuildinfo
+.git
+# Env files anywhere in the tree (apps/api/.env holds host-mode dev secrets) —
+# configuration reaches containers through compose, never baked into a layer.
+**/.env
+**/.env.local
+**/.env.*.local
+data/knowledge-repo
+coverage

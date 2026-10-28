@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Prisma
+apps/api/prisma/*.db
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+Thumbs.db
+
+# Git-backed docs working tree (created at runtime)
+data/knowledge-repo/
+
+# Test / coverage
+coverage/
+
+# Local credential store (encrypted cloud credentials + key file)
+data/
+*.enc.json
+*.enc.json.key
+
+# Local tooling / backups — never publish
+.claude/
+*.dump
+*.tgz

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Lint · typecheck · test · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cloudops
+          POSTGRES_PASSWORD: cloudops
+          POSTGRES_DB: cloudops_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U cloudops -d cloudops_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://cloudops:cloudops@localhost:5432/cloudops_test?schema=public
+      INTEGRATION_DATABASE_URL: postgresql://cloudops:cloudops@localhost:5432/cloudops_test?schema=public
+      INTEGRATION_REDIS_URL: redis://localhost:6379/0
+      PRISMA_HIDE_UPDATE_MESSAGE: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm --filter @cloudops/api prisma:generate
+
+      - name: Typecheck
+        run: |
+          pnpm typecheck
+          pnpm --filter @cloudops/api typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Apply database migrations
+        run: pnpm --filter @cloudops/api db:migrate
+
+      - name: API integration tests
+        run: pnpm --filter @cloudops/api test:integration
+
+      - name: Build web (production bundle)
+        run: pnpm --filter @cloudops/web build
+
+      - name: Dependency audit (production deps, high+)
+        # Reported, not blocking: advisories land continuously and need triage,
+        # not a red build. Dependabot opens the upgrade PRs.
+        continue-on-error: true
+        run: pnpm audit --prod --audit-level high
+
+  images:
+    name: Container images
+    runs-on: ubuntu-latest
+    needs: verify
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: false
+          tags: cloudops-api:ci
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: false
+          tags: cloudops-web:ci
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
